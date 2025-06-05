@@ -1,1 +1,1 @@
-# stock-alerts
+# market-signals
