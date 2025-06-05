@@ -2,9 +2,8 @@ name: collect-signals
 
 on:
   schedule:
-    # every 5 minutes from 13:00 to 20:00 UTC (which is 9:00am to 4:00pm US Eastern Time)
     - cron: '*/5 13-20 * * 1-5'
-  workflow_dispatch:     # allows manual triggering
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,7 +17,15 @@ jobs:
           cache: 'pip'
 
       - run: pip install -r requirements.txt
+      
       - run: python main.py
+        env:
+          REDDIT_ID: ${{ secrets.REDDIT_ID }}
+          REDDIT_SECRET: ${{ secrets.REDDIT_SECRET }}
+          REDDIT_USERAGENT: ${{ secrets.REDDIT_USERAGENT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
 
       - uses: EndBug/add-and-commit@v9
         with:
