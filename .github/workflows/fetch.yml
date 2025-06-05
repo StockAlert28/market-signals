@@ -1,0 +1,27 @@
+name: collect-signals
+
+on:
+  schedule:
+    # every 5 minutes from 13:00 to 20:00 UTC (which is 9:00am to 4:00pm US Eastern Time)
+    - cron: '*/5 13-20 * * 1-5'
+  workflow_dispatch:     # allows manual triggering
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+      - run: python main.py
+
+      - uses: EndBug/add-and-commit@v9
+        with:
+          message: "auto: update signals"
+          add: "signals.*"
+          default_author: github_actions
