@@ -1,104 +1,112 @@
 #!/usr/bin/env python3
-# ---------- market-signals v2  ---------------------------------------
-# Sends six different early-warning feeds to your downstream pipeline
-# (database → CSV → Telegram bot handled elsewhere).
-# --------------------------------------------------------------------
-
-import os, datetime, sqlite3, csv, json, time, requests, feedparser
+# market-signals – one-stop data pull for Telegram alerts
+# -------------------------------------------------------
+import os, datetime, sqlite3, csv, json, time, random, requests, feedparser
 from bs4 import BeautifulSoup
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import praw
 
-# ========== 0.  MEMORY: keep a ".last_seen.json" anti-spam ledger ====
-MEMFILE = ".last_seen.json"
+# ---------- 0.  GLOBALS --------------------------------------------
+HTTP_TIMEOUT = 8
+UA_HEADER    = {"User-Agent": "Mozilla/5.0 (GitHub Actions bot)"}
+MEMFILE      = ".last_seen.json"
 
-def _load_seen():
+# ---------- 1.  MEMORY (anti-spam) ---------------------------------
+def load_seen():
     try:
-        with open(MEMFILE, "r") as f:
-            return set(json.load(f))
+        return set(json.load(open(MEMFILE)))
     except FileNotFoundError:
         return set()
 
-def _save_seen(seen_set):
-    with open(MEMFILE, "w") as f:
-        json.dump(sorted(list(seen_set)), f)
+def save_seen(s):
+    json.dump(sorted(s), open(MEMFILE, "w"))
 
-seen = _load_seen()
+seen = load_seen()
 
 def is_new(uid: str) -> bool:
-    "Return True the first time we see uid, False afterwards."
     if uid in seen:
         return False
     seen.add(uid)
     return True
 
-# ========== 1.  BASIC SETUP ==========================================
-FINN   = os.getenv("FINNHUB_KEY")
-TW_BEAR= os.getenv("TWITTER_BEARER")       # for Twitter recent-search
-now    = datetime.datetime.utcnow().date()
-
-# DB / CSV
-db  = sqlite3.connect("signals.db")
-cur = db.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS signals(
-               ts TEXT, source TEXT, ticker TEXT,
-               headline TEXT, extra TEXT)""")
+# ---------- 2.  HELPERS --------------------------------------------
+def get_feed(url: str, tries: int = 3):
+    """Download RSS/Atom with timeout + polite UA; returns feedparser object."""
+    for n in range(tries):
+        try:
+            r = requests.get(url, timeout=HTTP_TIMEOUT, headers=UA_HEADER)
+            r.raise_for_status()
+            return feedparser.parse(r.content)
+        except Exception as e:
+            if n == tries - 1:
+                print("   (feed failed)", url[:60], e)
+                return feedparser.parse(b"")
+            time.sleep(3 * (2 ** n) + random.random())
 
 def push(row, uid):
-    "Insert row into DB & CSV if it's new."
+    """Insert into DB & CSV only if uid not seen before."""
     if not is_new(uid):
         return
     cur.execute("INSERT INTO signals VALUES (?,?,?,?,?)", row)
-    with open("signals.csv", "a", newline="") as f:
-        csv.writer(f).writerow(row)
+    csv.writer(csvfile).writerow(row)
 
-# Sentiment
+# ---------- 3.  SETUP ----------------------------------------------
+FINN_KEY = os.getenv("FINNHUB_KEY")
+TW_BEAR  = os.getenv("TWITTER_BEARER")
+now      = datetime.datetime.utcnow().date()
+
+db  = sqlite3.connect("signals.db")
+cur = db.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS signals(
+               ts TEXT, source TEXT, ticker TEXT, headline TEXT, extra TEXT)""")
+csvfile = open("signals.csv", "a", newline="")
+
 analyzer = SentimentIntensityAnalyzer()
 
-# Reddit
-reddit = praw.Reddit(client_id=os.getenv("REDDIT_ID"),
-                     client_secret=os.getenv("REDDIT_SECRET"),
-                     user_agent=os.getenv("REDDIT_USERAGENT"))
+# Reddit setup (skip if creds absent)
+reddit = None
+if os.getenv("REDDIT_ID") and os.getenv("REDDIT_SECRET"):
+    reddit = praw.Reddit(client_id=os.getenv("REDDIT_ID"),
+                         client_secret=os.getenv("REDDIT_SECRET"),
+                         user_agent=os.getenv("REDDIT_USERAGENT", "reddit-watcher"))
 
-# ========== 2.  SEC FILINGS  (Form 4 & 8-K) ==========================
-print("• SEC feeds…")
+# ---------- 4.  FEEDS ------------------------------------------------
+print("• SEC filings")
 for form in ("4", "8-K"):
-    rss = ( "https://www.sec.gov/cgi-bin/browse-edgar"
-            f"?action=getcurrent&type={form}&count=100&output=atom&owner=include" )
-    for entry in feedparser.parse(rss).entries:
-        uid = entry.id                                   # Permanent Atom GUID
-        ticker = entry.title.split()[0]
-        push([entry.updated, f"SEC{form}", ticker, entry.title, entry.link],
-             uid)
+    url = ("https://www.sec.gov/cgi-bin/browse-edgar?"
+           f"action=getcurrent&type={form}&owner=include&count=100&output=atom")
+    for e in get_feed(url).entries:
+        uid = e.id
+        ticker = e.title.split()[0]
+        push([e.updated, f"SEC{form}", ticker, e.title, e.link], uid)
 
-# ========== 3.  EARNINGS IN THE NEXT 72 H ========== ================
-print("• Earnings calendar…")
-r = requests.get("https://finnhub.io/api/v1/calendar/earnings",
-                 params={"from": now, "to": now + datetime.timedelta(days=2),
-                         "token": FINN}, timeout=10)
-for row in r.json().get("earningsCalendar", []):
-    uid = f"earn-{row['symbol']}-{row['date']}"
-    push([row["date"], "EARN", row["symbol"],
-          f"Earnings {row['date']} (est EPS {row.get('epsEstimate')})", ""],
-         uid)
+print("• Earnings calendar")
+if FINN_KEY:
+    resp = requests.get("https://finnhub.io/api/v1/calendar/earnings",
+                        params={"from": now, "to": now + datetime.timedelta(days=2),
+                                "token": FINN_KEY},
+                        timeout=HTTP_TIMEOUT, headers=UA_HEADER)
+    for row in resp.json().get("earningsCalendar", []):
+        uid = f"earn-{row['symbol']}-{row['date']}"
+        push([row["date"], "EARN", row["symbol"],
+              f"Earnings {row['date']} (est EPS {row.get('epsEstimate')})", ""], uid)
 
-# ========== 4.  BUSINESS WIRE PRESS RELEASES (keyword filter) =======
-print("• Business Wire PR…")
+print("• Business Wire PR")
 BW_RSS = ("https://services.businesswire.com/rss/home/?"
           "rssQuery=merger%20OR%20guidance%20OR%20contract%20award")
-for e in feedparser.parse(BW_RSS).entries:
+for e in get_feed(BW_RSS).entries:
     uid = e.id
     push([e.published, "PR", "", e.title, e.link], uid)
 
-# ========== 5.  UNUSUAL OPTIONS  (top rows scraped from Barchart) ====
-print("• Unusual options…")
+print("• Unusual options (Barchart)")
 try:
     soup = BeautifulSoup(requests.get(
-        "https://www.barchart.com/options/unusual-activity", timeout=10).text,
-        "html.parser")
-    for row in soup.select("table tbody tr")[:15]:           # first 15 rows
+        "https://www.barchart.com/options/unusual-activity",
+        timeout=HTTP_TIMEOUT, headers=UA_HEADER).text, "html.parser")
+    for row in soup.select("table tbody tr")[:15]:
         cols = [c.get_text(strip=True) for c in row.select("td")]
-        if len(cols) < 4: continue
+        if len(cols) < 4:
+            continue
         sym, vol = cols[0], cols[3]
         uid = f"opt-{sym}-{vol}"
         push([str(datetime.datetime.utcnow()), "OPT", sym,
@@ -106,49 +114,47 @@ try:
 except Exception as e:
     print("   (options scrape failed)", e)
 
-# ========== 6.  SOCIAL BUZZ  ========================================
-# 6a) Twitter recent-search (free 10-query / 15 min on the new Basic plan)
-print("• Twitter search…")
+print("• Twitter recent search")
 if TW_BEAR:
-    TW_QUERY  = "fda approval OR executive order OR $SPY OR tariff"
-    TW_URL    = "https://api.twitter.com/2/tweets/search/recent"
-    headers   = {"Authorization": f"Bearer {TW_BEAR}"}
-    params    = {"query": TW_QUERY, "max_results": 20,
-                 "tweet.fields": "created_at"}
     try:
-        tw = requests.get(TW_URL, headers=headers, params=params,
-                          timeout=10).json().get("data", [])
+        tw = requests.get("https://api.twitter.com/2/tweets/search/recent",
+                          headers={"Authorization": f"Bearer {TW_BEAR}"},
+                          params={"query": "fda approval OR executive order OR tariff",
+                                  "max_results": 25, "tweet.fields": "created_at"},
+                          timeout=HTTP_TIMEOUT).json().get("data", [])
         for t in tw:
             uid = f"tw-{t['id']}"
-            ts  = t["created_at"]
-            text= t["text"][:150].replace("\n", " ")
-            push([ts, "TWIT", "", text,
+            push([t["created_at"], "TWIT", "",
+                  t["text"].replace("\n", " ")[:150],
                   f"https://twitter.com/i/web/status/{t['id']}"], uid)
     except Exception as e:
         print("   (Twitter fetch failed)", e)
 
-# 6b) Reddit new posts (WSB + Stocks)
-print("• Reddit stream…")
-for post in reddit.subreddit("wallstreetbets+stocks").new(limit=25):
-    uid = f"rd-{post.id}"
-    if not is_new(uid):
-        continue
-    score = analyzer.polarity_scores(post.title)["compound"]
-    push([datetime.datetime.utcfromtimestamp(post.created_utc),
-          "REDDIT", "", post.title,
-          f"sent={score:.2f}|url={post.shortlink}"], uid)
+print("• Reddit stream")
+if reddit:
+    try:
+        for post in reddit.subreddit("wallstreetbets+stocks").new(limit=25):
+            uid = f"rd-{post.id}"
+            if not is_new(uid):
+                continue
+            s = analyzer.polarity_scores(post.title)["compound"]
+            push([datetime.datetime.utcfromtimestamp(post.created_utc),
+                  "REDDIT", "", post.title,
+                  f"sent={s:.2f}|url={post.shortlink}"], uid)
+    except Exception as e:
+        print("   (Reddit fetch failed)", e)
 
-# ========== 7.  POLICY-BOMB HEADLINES (Google News keywords) ========
-print("• Policy bomb headlines…")
+print("• Policy headlines")
 GN_RSS = ("https://news.google.com/rss/search?"
           "q=tariff+OR+antitrust+investigation+OR+rate+hike+site:reuters.com")
-for e in feedparser.parse(GN_RSS).entries:
+for e in get_feed(GN_RSS).entries:
     uid = e.id
     score = analyzer.polarity_scores(e.title)["compound"]
     push([e.published, "NEWS", "", e.title, f"sent={score:.2f}"], uid)
 
-# ========== 8.  CLOSE ===============================================
+# ---------- 5.  CLOSE ----------------------------------------------
 db.commit()
 db.close()
-_save_seen(seen)
-print("✅ All six feeds processed without spam duplicates")
+csvfile.close()
+save_seen(seen)
+print("✅ Feeds processed, duplicates suppressed")
